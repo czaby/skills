@@ -1,0 +1,1 @@
+Updated skill content with new rule: After every step in ISSUES, clearly define testable artifacts.
