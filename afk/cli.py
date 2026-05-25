@@ -1,12 +1,26 @@
 """
-Command-line interface for the AFK engine.
+Command-line interface for the AFK engine (minimal one-cycle wrapper).
 
-This is intentionally small. Most behavior lives in the engine modules.
+This remains intentionally tiny for ad-hoc debugging and simple one-shot
+inspections.
 
-As of #36: the thin runner entrypoint (this CLI, and real /afk orchestrator code)
-performs a one-time call to remove_stale_status_labels_once(...) at startup,
-before the first run_afk_cycle(). The hygiene function is narrow (only stale
-status-* label removal on agent issues using dual session+live detection).
+**For real /afk sessions (the persistent loop), use the canonical thin runner:**
+
+    python3 .grok/skills/afk/orchestrator.py          # full autonomous loop
+    python3 .grok/skills/afk/orchestrator.py --once   # single cycle (like this CLI)
+
+or import from the TUI harness:
+
+    from afk.orchestrator import AFKThinRunner, enrich_spawn_request_with_worktree
+
+See orchestrator.py for the authoritative "Very Thin Runner" implementation
+(hygiene once + loop + worktree materialization + CRITICAL prompt injection +
+#31 token hooks + session management).
+
+As of #36: the thin runner entrypoint performs a one-time call to
+remove_stale_status_labels_once(...) at startup, before the first
+run_afk_cycle(). The hygiene function is narrow (only stale status-* label
+removal on agent issues using dual session+live detection).
 The runner owns session loading, live subagent set construction, and all
 result processing / observability.
 """
@@ -104,6 +118,10 @@ def main() -> None:
 # See token_reporter.py, SKILL.md, and AFK_ENGINE_DESIGN.md for full contract + examples.
 # This is deliberately outside the engine (post-finish side effect, like #36 hygiene).
 # =============================================================================
+#
+# Full persistent orchestration (the code that actually drives repeated cycles
+# and hands SpawnRequests to the TUI harness) now lives in orchestrator.py.
+# This file is kept for backward compatibility and quick "one engine cycle" use.
 
 
 if __name__ == "__main__":

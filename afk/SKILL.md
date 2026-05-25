@@ -3,7 +3,7 @@ name: afk
 description: Autonomous parallel execution of ready agent-labeled GitHub issues using a deterministic engine + very thin runner model.
 ---
 
-> **2026+ Architecture**: The AFK system has been redesigned around an explicit, testable **AFK Engine**. The main orchestrator is now a Very Thin Runner that mostly just calls `run_afk_cycle()` and executes the `SpawnRequest`s it returns. Most judgment, prompt generation, worktree decisions, and state machine logic now live inside the deterministic engine (see `AFK_ENGINE_DESIGN.md` and the modules in this directory). The runner additionally performs a single one-time startup hygiene step (issue #36) using `remove_stale_status_labels_once` from the apply layer before the first cycle.
+> **2026+ Architecture**: The AFK system has been redesigned around an explicit, testable **AFK Engine**. The main orchestrator is now a Very Thin Runner (implemented in `orchestrator.py`) that mostly just calls `run_afk_cycle()` and executes the `SpawnRequest`s it returns. Most judgment, prompt generation, worktree decisions, and state machine logic now live inside the deterministic engine (see `AFK_ENGINE_DESIGN.md` and the modules in this directory). The runner additionally performs a single one-time startup hygiene step (issue #36) using `remove_stale_status_labels_once` from the apply layer before the first cycle.
 >
 > The older "smart orchestrator" model described in parts of this document is being phased out in favor of the new engine. New development should target the engine in `engine.py`, `state_machine.py`, `translator.py`, etc.
 >
@@ -641,7 +641,7 @@ The posted comment is both human-readable and contains a machine-readable JSON b
 
 **Non-goals (v1)**: Real-time streaming, per-tool breakdown, budget enforcement.
 
-See `token_reporter.py` (source + docstring), `cli.py` (example hook), and the matching section in `AFK_ENGINE_DESIGN.md`.
+See `token_reporter.py` (source + docstring), `orchestrator.py` (runner-owned #31 hook + completion handling), `cli.py` (legacy one-cycle reference), and the matching section in `AFK_ENGINE_DESIGN.md`.
 
 ---
 
@@ -773,14 +773,16 @@ See `AFK_ENGINE_DESIGN.md` for the full architecture and `engine.py` for the pri
 
 The older manual "smart orchestrator" loop is legacy and being phased out.
 
-### Implementation Modules (New AFK Engine)
+### Implementation Modules (New AFK Engine + Thin Runner)
 
-The deterministic AFK engine lives in this directory:
+The deterministic AFK engine + the Very Thin Runner live in this directory:
 
+- `orchestrator.py` — **Canonical thin runner** (hygiene once, full persistent loop, worktree path resolution, CRITICAL prompt injection, spawn hook points, #31 token reporting). This is what the TUI `/afk` handler and `python -m afk.orchestrator` should use.
+- `cli.py` — Minimal one-cycle CLI wrapper (still useful for ad-hoc debugging).
 - `engine.py` — Primary entrypoint `run_afk_cycle()`
 - `state_machine.py` — `decide_next_action()` + policy helpers (the explicit rules)
 - `translator.py` — Action → concrete plan (including rich prompt generation + checklist injection)
-- `apply.py` — Safe mutations (labels, session file, worktrees)
+- `apply.py` — Safe mutations (labels, session file, worktrees) + `remove_stale_status_labels_once` (#36)
 - `snapshot_builder.py` — Raw data → rich snapshots + context
 - `data_models.py` — All core typed models (`IssueSnapshot`, `SpawnRequest`, `AFKPlan`, `AFKCycleResult`, etc.)
 
@@ -862,7 +864,7 @@ while True:
 6. Test incrementally with `--dry-run` / `apply_changes=False` and the Docker test harness.
 7. Verify against the authoritative state machine rules in `state_machine.py` and tests.
 
-See `cli.py:30` (exact hygiene + cycle integration), `engine.py` docstring (resilience contract for thin runners), and `tests/test_engine_flow.py` (simulated thin-runner loops, multi-cycle, hygiene smoke).
+See `orchestrator.py` (the canonical thin runner with hygiene + full loop + worktree materialization + CRITICAL prompt injection), `cli.py` (still useful for one-cycle), `engine.py` docstring (resilience contract for thin runners), and `tests/test_engine_flow.py` (simulated thin-runner loops, multi-cycle, hygiene smoke).
 
 #### How to Run the Old and New Systems in Parallel During Transition
 
@@ -870,10 +872,10 @@ The design deliberately supports safe coexistence (no shared mutable state betwe
 
 - **Zero interference**: Legacy scripts perform only read-only `gh` queries (list/view). An active engine-based `/afk` loop (which also uses gh under the hood via the fetcher) can run at the same time.
 - **Practical patterns**:
-  - Primary autonomous work: Use the engine (`/afk`, your thin runner calling `run_afk_cycle`, or `python .grok/skills/afk/cli.py`).
+  - Primary autonomous work: Use the engine (`/afk` or `python .grok/skills/afk/orchestrator.py` — the canonical Very Thin Runner). `cli.py` remains for quick one-cycle ad-hoc/debug use.
   - Live inspection / debugging: Run `python .grok/skills/afk/fetch_afk_issues.py --json` (or the human form) in a separate shell. Compare its ready/blocked output to what the engine sees on a dry-run cycle.
   - Validation during custom runner development: Capture fetcher JSON, inject via patched `build_snapshots_and_context` (pattern used heavily in `test_engine_flow.py`), or run the legacy classifier side-by-side with engine results.
-  - One-off engine snapshot: `python .grok/skills/afk/cli.py --dry-run --no-apply`.
+  - One-off engine snapshot: `python .grok/skills/afk/orchestrator.py --once --dry-run` (or the older `cli.py` equivalent).
   - Full comparison harness: The 50+-issue load tests and multi-cycle simulations in the test suite exercise the engine while the underlying data layer is the same legacy code.
 - Docker-first verification works for all combinations (`run-afk-tests.sh` mounts the tree read-only for safety).
 - Benefit: You can keep legacy scripts around indefinitely for ad-hoc power and confidence checks while the production path is 100% the engine.

@@ -108,7 +108,8 @@ The `run_afk_cycle` function coordinates the other modules but contains minimal 
 ├── translator.py             # Action → AFKPlan (including prompt gen)
 ├── apply.py                  # Safe mutation application
 ├── snapshot_builder.py       # Raw data → rich snapshots + context
-├── cli.py                    # Command line interface
+├── cli.py                    # Minimal one-cycle CLI (ad-hoc/debug)
+├── orchestrator.py           # Canonical Very Thin Runner (full /afk loop, hygiene, worktree materialization, spawn hooks, #31 reporting) — preferred for TUI and direct use
 └── tests/
     └── ...                   # Fast, isolated tests (especially state machine)
 ```
@@ -226,7 +227,7 @@ This completes the "Apply Layer (Safe Mutations)" goal, closing the engine imple
 
 **Testing**: Added to `test_engine_flow.py` (TDD: tests first → GREEN; 45 tests total pass via `run-afk-tests.sh` Docker harness). Covers stale clean, dual-detection skips, non-qualifying issues, dry-run, partial failures, best-effort, and integration with `run_afk_cycle`.
 
-**CLI / Runner Integration**: `cli.py` (and real orchestrator code) now calls it at the documented point and prints summary results. Real runners supply the live `active_subagent_issues` set from their `spawn_subagent` / background task tracking.
+**CLI / Runner Integration**: `orchestrator.py` (the canonical thin runner) and `cli.py` call it at the documented point. Real runners (TUI `/afk` harness) supply the live `active_subagent_issues` set from their `spawn_subagent` / background task tracking.
 
 **Docs**: This section + updates to `SKILL.md`.
 
@@ -252,7 +253,7 @@ This completes the "Apply Layer (Safe Mutations)" goal, closing the engine imple
 
 **Testing**: New dedicated `tests/test_token_reporter.py` (TDD: RED first via import failure → GREEN with 6+ focused tests for estimator, dry-run, real gh path (mocked), failure resilience, session recording, contract). Full suite (now 65 tests) passes via `run-afk-tests.sh` (Docker python:3.12-slim).
 
-**Runner integration examples**: See updated `cli.py`, `afk-cycle-runner.py`, `afk-run-cycle.py`, and the new dedicated section in `SKILL.md`.
+**Runner integration examples**: See `orchestrator.py` (recommended), `cli.py` (one-cycle), and the dedicated thin-runner sections in `SKILL.md`.
 
 **Docs**: This section + comprehensive updates to `SKILL.md` (new "Token Usage Reporting (#31)" + loop example + future list + migration notes) + `token_reporter.py` docstring.
 
