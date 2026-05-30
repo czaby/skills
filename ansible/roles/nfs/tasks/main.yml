@@ -1,0 +1,56 @@
+---
+    - name: install nfs-common
+      become: true
+      apt:
+        state: latest
+        pkg: nfs-common
+
+    - name: remove nfs hase
+      become: true
+      ansible.posix.mount:
+        src: davidbowie.cicalak:/i-data/dee2c0f2/nfs/hase
+        path: /mnt/hase
+        opts: soft
+        state: absent
+        fstype: nfs
+
+    - name: remove nfs nyul
+      become: true
+      ansible.posix.mount:
+        src: davidbowie.cicalak:/i-data/75afccc7/nfs/nyul
+        path: /mnt/nyul
+        opts: soft
+        state: absent
+        fstype: nfs
+
+    - name: mount nfs temp
+      become: true
+      ansible.posix.mount:
+        src: quincyjones_local.cicalak.de:/mnt/wd30/temp
+        path: /mnt/temp
+        opts: soft
+        state: mounted
+        fstype: nfs
+
+    - name: Ensure /mnt/temp/immich dir exists (idempotent prep for Immich media migration to Central File Storage)
+      become: true
+      ansible.builtin.file:
+        path: /mnt/temp/immich
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: '0755'
+      # Prepares the common live UPLOAD_LOCATION for Primary (KoborJanos) + future Secondary per #57.
+      # 1000:1000 conventional for container volumes; perms allow docker runs. NFS export on quincyjones should permit (no_root_squash recommended).
+      # Run via existing site.yml (nfs group includes KoborJanos). See playbooks/prepare_immich_central_storage.yml for migration orchestration + script update.
+      # Part of #57 acceptance: tree ready with correct ownership/perms for secondary.
+
+    - name: mount nfs rabbit
+      become: true
+      ansible.posix.mount:
+        src: quincyjones_local.cicalak.de:/mnt/st12/rabbit
+        path: /mnt/rabbit
+        opts: soft
+        state: mounted
+        fstype: nfs
+

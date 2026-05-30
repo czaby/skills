@@ -1,0 +1,180 @@
+---
+# Narrow, focused Ansible playbook for Immich media migration prep + related updates (issue #57).
+#
+# Purpose (per grill-with-docs + issue #57 acceptance criteria):
+# - Ensure the target Central File Storage path /mnt/temp/immich exists with correct ownership + perms
+#   (idempotent; ready for Primary Immich on KoborJanos + future Secondary instance sharing the same tree).
+# - Deploy the updated daily backup script (config-only; no longer walks the ~1 TB media tree).
+# - Serve as the single source for the one-time migration procedure, rollback recipe, verification steps,
+#   and smoke tests. Run this, follow the numbered steps in the header below, then verify Immich health.
+#
+# THIS IS DELIBERATELY NARROW (no full "light Immich" role, no import into site.yml, no DR document,
+# no secondary deployment/failover logic — those belong to #56 hygiene / #58 resilience).
+# Previous over-scope attempts were rejected; this stays strictly on the storage move vertical slice.
+#
+# Usage (from Control Tower / prince or any ansible origin that can reach KoborJanos):
+#   ansible-playbook playbooks/prepare_immich_central_storage.yml --limit KoborJanos
+#
+# (The nfs role change in roles/nfs/tasks/main.yml — run via site.yml or nfs.yml as usual — also ensures
+# the dir on all cicalak hosts. This playbook re-applies the critical ensure + does the script deploy.)
+#
+# === ONE-TIME MIGRATION PROCEDURE (execute after running this playbook) ===
+# Estimated window: 2–4 hours for ~1 TB over 1 GbE NFS (real-world depends on NFS perf + disk speeds).
+# Perform during a maintenance window. Have rollback ready (see below). Keep old WD1T tree intact for >=1 full backup cycle post-go-live.
+#
+# Pre-reqs (on KoborJanos):
+# 1. Current Immich is healthy (test upload + view + "search" to trigger ML before starting).
+# 2. /mnt/temp is mounted and writable (this playbook + normal nfs play ensure it).
+# 3. Recent full backup of config exists in /mnt/me/immich_backup (run doDailyBackup.sh manually).
+# 4. nvidia-smi works (GPU for ML post-move validation).
+#
+# Steps (run as the user who owns /home/czaby/immich and can sudo; typically czaby):
+#   sudo -i
+#   cd /home/czaby
+#
+#   # 0. Record baselines (save output!)
+#   du -sh /mnt/WD1T/czaby/immich /mnt/temp/immich 2>/dev/null || du -sh /mnt/WD1T/czaby/immich
+#   find /mnt/WD1T/czaby/immich -type f | wc -l > /tmp/immich_before_count.txt
+#   df -h /mnt/temp /mnt/WD1T
+#
+#   # 1. Stop Immich cleanly (from the current compose dir; note current location via readlink if symlinked)
+#   cd /home/czaby/immich
+#   docker compose down
+#
+#   # 2. Create the small local compose dir (if not already separated) + migrate DATA ONLY to Central
+#   #    (We separate config from media during this migration so backup script stays small forever.)
+#   mkdir -p /home/czaby/immich_new_config
+#   # Copy ONLY the compose/config artifacts (tiny) to new location first:
+#   rsync -a --exclude='library' --exclude='upload' --exclude='thumbs' --exclude='profile' \
+#     --exclude='*.log' . /home/czaby/immich_new_config/
+#
+#   # 3. The big data move (the ~1 TB part; use screen/tmux; --progress + checksum for safety)
+#   #    Source is the current media root (resolves through any symlink).
+#   #    Target must exist (prepared by this playbook).
+#   time rsync -aHAX --progress --stats --checksum \
+#     --exclude='docker-compose.yml' --exclude='.env' --exclude='hwaccel*.yml' \
+#     --exclude='start-autossh.sh' --exclude='doDailyBackup.sh' \
+#     /mnt/WD1T/czaby/immich/ /mnt/temp/immich/   # adjust source if your WD1T path differs
+#
+#   # 4. Atomic swap of config location + update .env (critical)
+#   #    Backup old .env first!
+#   cp /home/czaby/immich/.env /home/czaby/immich/.env.pre57 || true
+#   # Move the old big tree out of the way (or leave for now; we'll clean after verification)
+#   mv /home/czaby/immich /home/czaby/immich.old-symlinked-wd1t || true
+#   mv /home/czaby/immich_new_config /home/czaby/immich
+#
+#   # Edit .env (use your editor):
+#   #   UPLOAD_LOCATION=/mnt/temp/immich
+#   #   (DB_DATA_LOCATION stays /home/czaby/postgres or equivalent local path)
+#   #   Verify no other absolute paths to old WD1T remain.
+#   #   Save. (Do NOT commit .env.)
+#
+#   # 5. Update crontab on KoborJanos (the @daily line now points at the updated script deployed by this playbook):
+#   #   crontab -e
+#   #   Ensure: @daily /home/czaby/doDailyBackup.sh >>/home/czaby/backup_cron.log 2>&1
+#   #   (The deployed script is already the post-#57 version.)
+#
+#   # 6. Start Immich against the new tree
+#   cd /home/czaby/immich
+#   docker compose up -d
+#   # Watch logs: docker compose logs -f immich-server immich-machine-learning
+#   # Expect: successful startup, CUDA providers visible in ML logs (from prior #59 GPU work).
+#
+#   # 7. Post-move verification (must all pass; record output for handoff)
+#   #   - Existing assets viewable in UI (https://immich.cicalak.de)
+#   #   - New photo upload succeeds + appears
+#   #   - Trigger ML: Admin > Jobs > "Run all" or search for a face / "Smart search" a known object
+#   #   - During ML job: nvidia-smi should show load; logs show CUDAExecutionProvider
+#   #   - File counts match: cat /tmp/immich_before_count.txt ; find /mnt/temp/immich -type f | wc -l
+#   #   - Spot checksum (pick 3-5 random originals that existed before): md5sum on old (in .old dir) vs new
+#   #   - du -sh /mnt/temp/immich (should be ~ same as pre)
+#   #   - Backup now tiny: du -sh /mnt/me/immich_backup ; ls /mnt/me/immich_backup (no library/)
+#   #   - /home/czaby/immich is small real dir (not symlink): ls -ld /home/czaby/immich ; readlink ...
+#   #   - Health: docker compose ps ; curl -I https://immich.cicalak.de
+#
+#   # 8. If all green for 24h + one successful daily backup: optional cleanup of old WD1T copy
+#   #   rm -rf /home/czaby/immich.old-symlinked-wd1t   (after confirming /mnt/temp/immich is authoritative)
+#
+# === ROLLBACK (one paragraph, keep old tree until verified) ===
+# If problems: docker compose down; edit .env back to old UPLOAD_LOCATION=/mnt/WD1T/czaby/immich (or restore .env.pre57);
+# rm -f /home/czaby/immich; ln -s /mnt/WD1T/czaby/immich /home/czaby/immich; restore old doDailyBackup.sh from backup;
+# docker compose up -d; verify. The old WD1T tree was never deleted during migration, so instant revert possible.
+# Re-run the old backup script version if needed. Full data still on WD1T until explicit cleanup.
+#
+# === SMOKE TESTS (post start, from grill) ===
+# - Upload brand new photo via mobile app or web (must succeed, thumbnail + ML processed).
+# - View random existing asset (full res + info).
+# - Run facial recognition or "search" for "cat" / known object (must return results quickly; watch nvidia-smi).
+# - Check Immich web UI / admin jobs complete without errors.
+# - Check no new errors in docker logs related to /data path.
+#
+# NFS performance note (from grill risk): If ML/thumbnail times regress unacceptably vs local WD1T, tune NFS
+# (async, rsize/wsize, caching) or consider hybrid (recent hot media local + cold on NFS) in follow-up.
+# Measured delta should be captured in the GitHub issue handoff comment.
+#
+# Owner: czaby (Solo Operator). Changes via AFK implementor on afk/57 in grok worktree (ansible/ snapshot).
+# After apply on Control Tower: git pull in /home/czaby/w/docker/ansible (or wherever the live ansible checkout lives),
+# then run the playbook + the manual steps above.
+#
+# Related: #55 (parent resilience), #56 (hygiene — do not duplicate DR here), #58 (unblocked by this), #59 (GPU already done).
+
+- name: Prepare Central File Storage path + updated backup script for Immich migration (#57)
+  hosts: docker
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Debug — confirm target host has the expected mount point
+      ansible.builtin.debug:
+        msg: "Running Immich storage prep on {{ inventory_hostname }}. /mnt/temp should be mounted from quincyjones."
+      when: inventory_hostname == "KoborJanos"
+
+    - name: Ensure /mnt/temp/immich exists with correct ownership/perms (for Primary + Secondary)
+      ansible.builtin.file:
+        path: /mnt/temp/immich
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: '0755'
+      # Duplicates the (now idempotent) logic added to roles/nfs/tasks/main.yml for standalone use of this narrow playbook.
+      # See that role task + CONTEXT.md for rationale. Safe to re-run.
+
+    - name: Backup existing doDailyBackup.sh (if present) before update
+      ansible.builtin.copy:
+        src: /home/czaby/doDailyBackup.sh
+        dest: /home/czaby/doDailyBackup.sh.pre57
+        remote_src: true
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_id }}"
+        mode: '0644'
+      ignore_errors: true
+      when: inventory_hostname == "KoborJanos"
+
+    - name: Deploy updated post-#57 doDailyBackup.sh (config-only, excludes media tree)
+      ansible.builtin.template:
+        src: doDailyBackup_immich.j2
+        dest: /home/czaby/doDailyBackup.sh
+        owner: "{{ ansible_user_id | default('czaby') }}"
+        group: "{{ ansible_user_id | default('czaby') }}"
+        mode: '0755'
+      when: inventory_hostname == "KoborJanos"
+      # The template lives in ansible/templates/ (part of this collection). After migration, crontab on KoborJanos
+      # should invoke this (already the case pre-#57; no change needed to crontab entry itself).
+
+    - name: Verify the deployed script is the config-only version
+      ansible.builtin.shell: |
+        head -5 /home/czaby/doDailyBackup.sh
+        grep -i "Central File Storage" /home/czaby/doDailyBackup.sh || echo "WARNING: migration marker not found"
+      register: script_check
+      changed_when: false
+      when: inventory_hostname == "KoborJanos"
+
+    - name: Report verification status
+      ansible.builtin.debug:
+        msg:
+          - "=== Immich Central Storage Prep complete on {{ inventory_hostname }} ==="
+          - "Dir /mnt/temp/immich: ensured (1000:1000 0755)"
+          - "Backup script updated + pre57 backup saved"
+          - "Script head: {{ script_check.stdout_lines | default([]) }}"
+          - "NEXT: Follow the FULL numbered migration procedure in the playbook HEADER (above)."
+          - "Record all outputs (du, counts, timings, smoke results) for the GitHub #57 handoff comment."
+          - "Rollback recipe also in the header."
