@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+
+# Immich daily backup script (updated for #57 media migration to Central File Storage).
+# 
+# Post-migration reality (see CONTEXT.md "Immich Photo Service" section):
+# - Media (library/, upload/, thumbs/ etc.) now lives at /mnt/temp/immich (NFS from quincyjones Central File Storage).
+#   This is the single live copy for Primary + future Secondary. Protected by Central File Storage's backup/DR + future 1-2-3 offsite.
+# - /home/czaby/immich on KoborJanos is now a regular (small) directory containing ONLY config:
+#   docker-compose.yml, .env, hwaccel*.yml, start-autossh.sh, this script, etc. (no symlink to WD1T media anymore).
+# - DB remains local on root disk (/home/czaby/postgres via DB_DATA_LOCATION in .env); use periodic dumps for failover.
+#
+# This script therefore ONLY rsyncs the tiny config tree to /mnt/me/immich_backup/.
+# It explicitly excludes any media dirs (in case of leftover state during migration window).
+#
+# Run: from crontab @daily (or manually). Idempotent.
+# Deployed/updated via ansible playbooks/prepare_immich_central_storage.yml (narrow, --limit KoborJanos).
+#
+# Rollback (if needed): restore old symlink + old .env UPLOAD_LOCATION + old version of this script, then docker compose up.
+#
+# Verification: ls -l /home/czaby/immich (should be small, no 100k+ files); du -sh /mnt/me/immich_backup (tiny MBs not TBs);
+#   check backup.log for recent success + "config backup complete" line.
+#
+# See: issue #57, grill-with-docs comment, prepare_immich_central_storage.yml header for full one-time migration steps + smoke tests.
+
+cd /home/czaby/immich
+
+rsync -a --stats \
+  --exclude='*.log' \
+  --exclude='library' \
+  --exclude='upload' \
+  --exclude='thumbs' \
+  --exclude='profile' \
+  . /mnt/me/immich_backup/ >>backup.log 2>&1 || true
+
+date >> backup.log
+echo "Immich config-only backup complete (media now on Central File Storage /mnt/temp/immich per #57)" >> backup.log
