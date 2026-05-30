@@ -29,11 +29,13 @@ def run_afk_cycle(
 
     High-level flow:
         1. Gather raw state (GitHub + filesystem + session)
-        2. Build rich IssueSnapshots + AFKContext (with engine-level retry for transients)
-        3. Run the state machine for each relevant issue (per-snapshot isolation)
-        4. Translate high-level decisions into a concrete AFKPlan
-        5. Apply safe mutations (unless dry_run or apply_changes=False; already best-effort)
-        6. Return a rich AFKCycleResult (including SpawnRequests, .errors on any layer failure)
+        2. Build rich IssueSnapshots + AFKContext
+        3. Repeatedly run the state machine + translate + apply (bounded internal passes)
+           so that RequestWorktreeCleanup (and similar non-spawn progress actions)
+           automatically cause follow-up decisions (e.g. rejection → cleanup →
+           SpawnImplementor for retry) inside the *same* run_afk_cycle() call.
+        4. Return a rich AFKCycleResult (SpawnRequests from the final stable state,
+           all applied side-effects, errors, etc.)
 
     #26 resilience: NEVER raises on normal layer failures (snapshot builder, SM,
     translator, apply). Always returns AFKCycleResult. Rich structured errors
@@ -80,22 +82,109 @@ def run_afk_cycle(
             # retry on transient (no sleep for test speed / determinism)
             snapshots, context = [], context
 
-    # 3. Run the state machine for each issue (per-snapshot isolation for resilience)
-    actions = []
-    for snap in snapshots:
+    # 3–6. Multi-pass decision + apply loop (the key fix).
+    # If RequestWorktreeCleanup is emitted (rejection path, stale worktree, etc.),
+    # we apply it and immediately re-evaluate inside the same run_afk_cycle() so
+    # the follow-on SpawnImplementor for a retry (or other progress) is produced
+    # automatically. The thin runner no longer has to manually "remember" to
+    # re-cycle after a cleanup.
+    max_internal_passes = 4
+    all_actions: list = []
+    all_spawn_requests: list[SpawnRequest] = []
+    all_applied: list = []
+
+    for _internal_pass in range(max_internal_passes):
         try:
-            action = decide_next_action(snap, context)
-            if action.__class__.__name__ != "NoOp":
-                actions.append(action)
+            pass_snapshots, pass_context = build_snapshots_and_context(raw_state)
         except Exception as e:
             errors.append({
-                "phase": "state_machine",
-                "issue": getattr(snap, "number", None),
+                "phase": "snapshot",
                 "error": str(e),
                 "type": type(e).__name__,
-                "details": "decide_next_action failed for this snapshot (isolated)",
-                "attempt": 1,
+                "details": f"build_snapshots_and_context failed on internal pass {_internal_pass}",
+                "attempt": _internal_pass,
             })
+            break
+
+        actions_this_pass = []
+        for snap in pass_snapshots:
+            try:
+                action = decide_next_action(snap, pass_context)
+                if action.__class__.__name__ != "NoOp":
+                    actions_this_pass.append(action)
+            except Exception as e:
+                errors.append({
+                    "phase": "state_machine",
+                    "issue": getattr(snap, "number", None),
+                    "error": str(e),
+                    "type": type(e).__name__,
+                    "details": "decide_next_action failed (internal pass)",
+                    "attempt": _internal_pass,
+                })
+
+        if not actions_this_pass:
+            break
+
+        plan = None
+        try:
+            plan = translate_actions_to_plan(actions_this_pass, pass_context)
+        except Exception as e:
+            errors.append({
+                "phase": "translator",
+                "error": str(e),
+                "type": type(e).__name__,
+                "details": "translate_actions_to_plan failed (internal pass)",
+                "attempt": _internal_pass,
+            })
+            break
+
+        applied_this_pass: list = []
+        if apply_changes and not dry_run:
+            try:
+                applied_this_pass = apply_safe_plan(plan, pass_context, dry_run=dry_run) or []
+                all_applied.extend(applied_this_pass)
+            except Exception as e:
+                errors.append({
+                    "phase": "apply",
+                    "error": str(e),
+                    "type": type(e).__name__,
+                    "details": "apply_safe_plan failed (internal pass)",
+                    "attempt": _internal_pass,
+                })
+
+        if plan:
+            for item in plan.plan_items:
+                if isinstance(item, SpawnRequest):
+                    all_spawn_requests.append(item)
+
+        all_actions.extend(actions_this_pass)
+
+        # Continue while we produced non-spawn progress (especially
+        # RequestWorktreeCleanup). The next internal pass will see the
+        # post-cleanup snapshot and can emit the retry SpawnImplementor.
+        had_non_spawn_progress = any(
+            not isinstance(item, SpawnRequest)
+            for item in (plan.plan_items if plan else [])
+        )
+        if not had_non_spawn_progress:
+            break
+
+    notes = [
+        f"Cycle complete. High-level actions (all passes): {len(all_actions)}",
+        f"Internal decision passes: {_internal_pass + 1}",
+        f"SpawnRequests produced: {len(all_spawn_requests)}",
+    ]
+    if errors:
+        notes.append(f"errors recorded: {len(errors)} (see .errors for details)")
+
+    return AFKCycleResult(
+        spawn_requests=all_spawn_requests,
+        plan=None,
+        applied_changes=all_applied,
+        notes=notes,
+        no_more_work=(len(all_actions) == 0 and len(errors) == 0),
+        errors=errors,
+    )
 
     # 4. Translate high-level actions into a concrete AFKPlan
     plan = None
